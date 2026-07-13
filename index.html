@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Prism — step 1 scaffold</title>
+<title>Prism — step 2: orbit traps + shadows + AO</title>
 <style>html,body{margin:0;padding:0;overflow:hidden;background:#000}canvas{display:block}</style>
 </head>
 <body>
@@ -24,6 +24,7 @@ const uniforms = {
   uResolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
   // Audio uniforms — wired to 0 for now; the analysis layer (§2) drives these later
   uBass:   { value: 0 },
+  uTreble: { value: 0 },
   uEnergy: { value: 0 },
   uBeat:   { value: 0 },
 };
@@ -33,21 +34,26 @@ precision highp float;
 uniform float uTime;
 uniform vec2  uResolution;
 uniform float uBass;
+uniform float uTreble;
 uniform float uEnergy;
 uniform float uBeat;
 
-// ---- Mandelbulb distance estimator with orbit trap ----
-// Returns distance; writes closest orbit-trap value to 'trap'
-float mandelbulbDE(vec3 pos, out float trap) {
+// ---- Mandelbulb distance estimator with multi-component orbit trap ----
+// trap.x: min |z|            (sphere trap  -> base colour ramp)
+// trap.y: min |z.y|          (plane trap   -> banding / highlight veins)
+// trap.z: min |z.xz|         (axis trap    -> iridescent core glow)
+float mandelbulbDE(vec3 pos, out vec3 trap) {
   vec3 z = pos;
   float dr = 1.0;
   float r  = 0.0;
-  trap = 1e10;
-  // Power breathes on bass later; static 8.0 for step 1
+  trap = vec3(1e10);
+  // Power breathes on bass later; static 8.0 for now
   float power = 8.0 + uBass * 2.0;
   for (int i = 0; i < 12; i++) {
     r = length(z);
-    trap = min(trap, r);          // simple sphere orbit trap
+    trap.x = min(trap.x, r);
+    trap.y = min(trap.y, abs(z.y));
+    trap.z = min(trap.z, length(z.xz));
     if (r > 2.0) break;
     float theta = acos(z.z / r) * power;
     float phi   = atan(z.y, z.x) * power;
@@ -58,14 +64,20 @@ float mandelbulbDE(vec3 pos, out float trap) {
   return 0.5 * log(r) * r / dr;
 }
 
+// Distance-only wrapper for normals / shadows / AO (trap unused)
+float mapDE(vec3 p) {
+  vec3 tr;
+  return mandelbulbDE(p, tr);
+}
+
 // ---- Sphere tracing ----
-float march(vec3 ro, vec3 rd, out float trap, out int steps) {
+float march(vec3 ro, vec3 rd, out vec3 trap, out int steps) {
   float t = 0.0;
-  trap = 1e10;
+  trap = vec3(1e10);
   for (int i = 0; i < 96; i++) {   // step count scales with quality tier later
     steps = i;
     vec3 p = ro + rd * t;
-    float tr;
+    vec3 tr;
     float d = mandelbulbDE(p, tr);
     trap = min(trap, tr);
     if (d < 0.0012 * t) return t;  // epsilon scales with distance
@@ -76,13 +88,54 @@ float march(vec3 ro, vec3 rd, out float trap, out int steps) {
 }
 
 vec3 getNormal(vec3 p) {
-  float tr;
   vec2 e = vec2(0.0015, 0.0);
   return normalize(vec3(
-    mandelbulbDE(p + e.xyy, tr) - mandelbulbDE(p - e.xyy, tr),
-    mandelbulbDE(p + e.yxy, tr) - mandelbulbDE(p - e.yxy, tr),
-    mandelbulbDE(p + e.yyx, tr) - mandelbulbDE(p - e.yyx, tr)
+    mapDE(p + e.xyy) - mapDE(p - e.xyy),
+    mapDE(p + e.yxy) - mapDE(p - e.yxy),
+    mapDE(p + e.yyx) - mapDE(p - e.yyx)
   ));
+}
+
+// ---- Soft shadows: march toward the light, penumbra from closest approach ----
+float softShadow(vec3 ro, vec3 rd, float k) {
+  float res = 1.0;
+  float t = 0.015;
+  for (int i = 0; i < 32; i++) {   // shadow steps scale with quality tier later
+    float d = mapDE(ro + rd * t);
+    res = min(res, k * d / t);
+    if (res < 0.005 || t > 3.0) break;
+    t += clamp(d, 0.012, 0.25);
+  }
+  return clamp(res, 0.0, 1.0);
+}
+
+// ---- SDF ambient occlusion: sample true distance along the normal ----
+float calcAO(vec3 p, vec3 n) {
+  float occ = 0.0;
+  float sca = 1.0;
+  for (int i = 0; i < 5; i++) {
+    float h = 0.012 + 0.11 * float(i) / 4.0;
+    float d = mapDE(p + n * h);
+    occ += (h - d) * sca;
+    sca *= 0.8;
+  }
+  return clamp(1.0 - 1.8 * occ, 0.0, 1.0);
+}
+
+// ---- Orbit-trap surface colour (preset palettes replace this ramp later) ----
+vec3 trapColour(vec3 trap) {
+  // Trap sharpness shimmers on treble later; static base for now
+  float sharp = 1.5 + uTreble * 2.0;
+  // Base ramp indexed by sphere-trap distance
+  vec3 col = 0.5 + 0.5 * cos(6.28318 * (trap.x * sharp + vec3(0.0, 0.33, 0.67)) + uTime * 0.1);
+  col *= col;                       // deepen: push ramp away from pastel midtones
+  // Plane trap: bright veins where the orbit skimmed the y=0 plane
+  float vein = exp(-16.0 * trap.y);
+  col = mix(col, vec3(1.0, 0.85, 0.5), 0.6 * vein);
+  // Axis trap: cool iridescent glow where the orbit hugged the y axis
+  float core = exp(-12.0 * trap.z);
+  col = mix(col, vec3(0.4, 0.85, 1.0), 0.45 * core);
+  return col;
 }
 
 void main() {
@@ -97,18 +150,43 @@ void main() {
   vec3 up = cross(fw, rt);
   vec3 rd = normalize(uv.x * rt + uv.y * up + 1.6 * fw);
 
-  float trap; int steps;
+  // Background: subtle vertical nebula gradient
+  vec3 bg = mix(vec3(0.012, 0.010, 0.025), vec3(0.030, 0.015, 0.045),
+                smoothstep(-0.8, 0.9, uv.y));
+  vec3 col = bg;
+
+  vec3 trap; int steps;
   float t = march(ro, rd, trap, steps);
 
-  vec3 col = vec3(0.01, 0.01, 0.02); // background
   if (t > 0.0) {
     vec3 p = ro + rd * t;
     vec3 n = getNormal(p);
-    float diff = max(dot(n, normalize(vec3(0.6, 0.8, 0.3))), 0.0);
-    float ao = 1.0 - float(steps) / 96.0;         // cheap step-count AO
-    // Orbit-trap palette (preset system replaces this ramp later)
-    vec3 ramp = 0.5 + 0.5 * cos(6.28318 * (trap * 1.5 + vec3(0.0, 0.33, 0.67)) + uTime * 0.1);
-    col = ramp * (0.25 + 0.75 * diff) * ao;
+
+    vec3 lig = normalize(vec3(0.6, 0.8, 0.3));
+    float dif = clamp(dot(n, lig), 0.0, 1.0);
+    float sha = softShadow(p + n * 0.003, lig, 12.0);
+
+    // SDF AO blended with the cheap step-count AO from step 1
+    float aoSdf  = calcAO(p, n);
+    float aoStep = 1.0 - float(steps) / 96.0;
+    float ao = aoSdf * (0.5 + 0.5 * aoStep);
+
+    float sky = clamp(0.5 + 0.5 * n.y, 0.0, 1.0);
+    float bou = clamp(0.3 - 0.7 * n.y, 0.0, 1.0);
+    vec3  hal = normalize(lig - rd);
+    float spe = pow(clamp(dot(n, hal), 0.0, 1.0), 32.0) * dif * sha;
+    float fre = pow(clamp(1.0 + dot(n, rd), 0.0, 1.0), 4.0);
+
+    vec3 lin = vec3(0.0);
+    lin += 1.30 * dif * sha * vec3(1.00, 0.95, 0.85);   // key light, shadowed
+    lin += 0.40 * sky * ao  * vec3(0.50, 0.70, 1.00);   // sky fill
+    lin += 0.15 * bou * ao  * vec3(0.60, 0.40, 0.30);   // ground bounce
+    lin += 0.25 * fre * ao  * vec3(0.80, 0.90, 1.00);   // rim
+
+    col = trapColour(trap) * lin + spe * 0.7 * vec3(1.0, 0.97, 0.9);
+
+    // Distance fog into the background for depth
+    col = mix(col, bg, smoothstep(2.5, 7.0, t));
   }
 
   // simple gamma; ACES tone mapping arrives with the post chain (§4)
