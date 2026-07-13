@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Prism — step 1 scaffold</title>
+<style>html,body{margin:0;padding:0;overflow:hidden;background:#000}canvas{display:block}</style>
+</head>
+<body>
+<script type="module">
+import * as THREE from 'https://unpkg.com/three@0.164.1/build/three.module.js';
+
+const renderer = new THREE.WebGLRenderer({ antialias: false });
+// DPR clamp — critical on iPhone (reports 3, kills perf)
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+const uniforms = {
+  uTime:       { value: 0 },
+  uResolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
+  // Audio uniforms — wired to 0 for now; the analysis layer (§2) drives these later
+  uBass:   { value: 0 },
+  uEnergy: { value: 0 },
+  uBeat:   { value: 0 },
+};
+
+const fragmentShader = /* glsl */`
+precision highp float;
+uniform float uTime;
+uniform vec2  uResolution;
+uniform float uBass;
+uniform float uEnergy;
+uniform float uBeat;
+
+// ---- Mandelbulb distance estimator with orbit trap ----
+// Returns distance; writes closest orbit-trap value to 'trap'
+float mandelbulbDE(vec3 pos, out float trap) {
+  vec3 z = pos;
+  float dr = 1.0;
+  float r  = 0.0;
+  trap = 1e10;
+  // Power breathes on bass later; static 8.0 for step 1
+  float power = 8.0 + uBass * 2.0;
+  for (int i = 0; i < 12; i++) {
+    r = length(z);
+    trap = min(trap, r);          // simple sphere orbit trap
+    if (r > 2.0) break;
+    float theta = acos(z.z / r) * power;
+    float phi   = atan(z.y, z.x) * power;
+    float zr    = pow(r, power);
+    dr = pow(r, power - 1.0) * power * dr + 1.0;
+    z = zr * vec3(sin(theta)*cos(phi), sin(theta)*sin(phi), cos(theta)) + pos;
+  }
+  return 0.5 * log(r) * r / dr;
+}
+
+// ---- Sphere tracing ----
+float march(vec3 ro, vec3 rd, out float trap, out int steps) {
+  float t = 0.0;
+  trap = 1e10;
+  for (int i = 0; i < 96; i++) {   // step count scales with quality tier later
+    steps = i;
+    vec3 p = ro + rd * t;
+    float tr;
+    float d = mandelbulbDE(p, tr);
+    trap = min(trap, tr);
+    if (d < 0.0012 * t) return t;  // epsilon scales with distance
+    if (t > 8.0) break;
+    t += d;
+  }
+  return -1.0;
+}
+
+vec3 getNormal(vec3 p) {
+  float tr;
+  vec2 e = vec2(0.0015, 0.0);
+  return normalize(vec3(
+    mandelbulbDE(p + e.xyy, tr) - mandelbulbDE(p - e.xyy, tr),
+    mandelbulbDE(p + e.yxy, tr) - mandelbulbDE(p - e.yxy, tr),
+    mandelbulbDE(p + e.yyx, tr) - mandelbulbDE(p - e.yyx, tr)
+  ));
+}
+
+void main() {
+  vec2 uv = (gl_FragCoord.xy * 2.0 - uResolution) / uResolution.y;
+
+  // Slow orbiting camera; the flight path (§3) replaces this later
+  float a = uTime * 0.15;
+  vec3 ro = vec3(2.2 * sin(a), 0.6 * sin(uTime * 0.1), 2.2 * cos(a));
+  vec3 ta = vec3(0.0);
+  vec3 fw = normalize(ta - ro);
+  vec3 rt = normalize(cross(vec3(0.0, 1.0, 0.0), fw));
+  vec3 up = cross(fw, rt);
+  vec3 rd = normalize(uv.x * rt + uv.y * up + 1.6 * fw);
+
+  float trap; int steps;
+  float t = march(ro, rd, trap, steps);
+
+  vec3 col = vec3(0.01, 0.01, 0.02); // background
+  if (t > 0.0) {
+    vec3 p = ro + rd * t;
+    vec3 n = getNormal(p);
+    float diff = max(dot(n, normalize(vec3(0.6, 0.8, 0.3))), 0.0);
+    float ao = 1.0 - float(steps) / 96.0;         // cheap step-count AO
+    // Orbit-trap palette (preset system replaces this ramp later)
+    vec3 ramp = 0.5 + 0.5 * cos(6.28318 * (trap * 1.5 + vec3(0.0, 0.33, 0.67)) + uTime * 0.1);
+    col = ramp * (0.25 + 0.75 * diff) * ao;
+  }
+
+  // simple gamma; ACES tone mapping arrives with the post chain (§4)
+  col = pow(col, vec3(0.4545));
+  gl_FragColor = vec4(col, 1.0);
+}
+`;
+
+const mat = new THREE.ShaderMaterial({
+  uniforms,
+  vertexShader: `void main(){ gl_Position = vec4(position, 1.0); }`,
+  fragmentShader,
+});
+scene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mat));
+
+window.addEventListener('resize', () => {
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  uniforms.uResolution.value.set(window.innerWidth, window.innerHeight);
+});
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  uniforms.uTime.value = clock.getElapsedTime();
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
